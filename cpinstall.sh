@@ -1,166 +1,389 @@
-#!/bin/bash
-#==============================================================================
-# cPanel & WHM Free Trial Installer for Ubuntu VPS
-#------------------------------------------------------------------------------
-# Description : Installs cPanel & WHM on Ubuntu and activates a 15-day
-#               free trial license automatically from cpanel.net.
-# Supported OS: Ubuntu 20.04 LTS, Ubuntu 22.04 LTS (x86_64)
-# Usage       : sudo bash install-cpanel-trial-ubuntu.sh
-# Author      : Sysadmin Toolkit
-# License     : MIT
-#==============================================================================
+#!/usr/bin/env bash
+#
+# ==============================================================================
+#  cPanel & WHM Free Trial License — Universal VPS Installer
+# ==============================================================================
+#
+#  This script automates the installation of cPanel & WHM on a supported
+#  Linux VPS and automatically requests/activates the 15-day free trial
+#  license from cPanel's license servers.
+#
+#  IMPORTANT — READ FIRST:
+#  cPanel & WHM is officially supported ONLY on 64-bit, minimal installs of:
+#     - AlmaLinux 8 / 9
+#     - Rocky Linux 8 / 9
+#     - CloudLinux 8 / 9
+#     - RHEL 8 / 9  (with active subscription)
+#  It is NOT supported on Ubuntu, Debian, Fedora, Arch, Windows, etc.
+#  This script will detect your OS, warn you if it is unsupported, and
+#  refuse to run the destructive installation steps on incompatible systems
+#  (you may force it with --force, at your own risk — it will still fail
+#  when the upstream cPanel installer performs its own OS check).
+#
+#  USAGE:
+#     sudo bash install-cpanel-trial.sh [options]
+#
+#  OPTIONS:
+#     --hostname <fqdn>     Set the server hostname before installing
+#     --skip-checks         Skip RAM/disk/CPU pre-flight checks
+#     --no-firewall-disable Do not disable firewalld/NetworkManager
+#     --force               Attempt install even on an unsupported OS
+#     --yes, -y             Non-interactive mode (auto-confirm prompts)
+#     --help, -h            Show usage information
+#
+#  WHAT THIS SCRIPT DOES:
+#     1. Verifies you are root and gathers system information
+#     2. Detects the OS/distro and validates cPanel compatibility
+#     3. Checks minimum hardware requirements (CPU, RAM, disk)
+#     4. Optionally sets a fully-qualified hostname
+#     5. Disables conflicting services (NetworkManager/firewalld) if present
+#     6. Installs prerequisites (perl, curl, tar)
+#     7. Downloads and runs the official cPanel installer
+#        (https://securedownloads.cpanel.net/latest)
+#     8. Runs cpkeyclt to request/activate the free trial license
+#     9. Verifies the license and prints login details
+#
+#  LICENSE NOTE:
+#  New cPanel & WHM installations automatically receive an evaluation
+#  (trial) license valid for a limited number of days (historically up to
+#  15 days, subject to change by cPanel L.L.C.). No account or payment
+#  info is required to obtain it — it is issued automatically to your
+#  server's public IP by cPanel's licensing servers as long as port 80/443
+#  outbound access is available. After the trial period you must purchase
+#  a license to keep using the software.
+#
+# ==============================================================================
 
-set -e
+set -uo pipefail
 
-# ---------- Colors ----------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# ---------------------------------------------------------------------------
+# Globals & defaults
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION="1.0.0"
+LOG_FILE="/var/log/cpanel-trial-install.log"
+HOSTNAME_ARG=""
+SKIP_CHECKS=0
+DISABLE_FIREWALL=1
+FORCE_INSTALL=0
+ASSUME_YES=0
+CPANEL_INSTALLER_URL="https://securedownloads.cpanel.net/latest"
+MIN_RAM_MB=1536          # cPanel hard minimum ~1GB, recommend 2GB+
+MIN_DISK_GB=20
+MIN_CPU_MHZ=1000
 
-log()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $1"; }
-info() { echo -e "${BLUE}[STEP]${NC}  $1"; }
-err()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+# Colors
+C_RESET="\033[0m"; C_RED="\033[1;31m"; C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"; C_BLUE="\033[1;34m"; C_CYAN="\033[1;36m"; C_BOLD="\033[1m"
 
-clear
-echo -e "${BLUE}=====================================================${NC}"
-echo -e "${BLUE}  cPanel & WHM License Installer for VPS   ${NC}"
-echo -e "${BLUE}         1 Monthly Licensel • Auto-Activated               ${NC}"
-echo -e "${BLUE}=====================================================${NC}\n"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+log()      { echo -e "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" >/dev/null; }
+info()     { echo -e "${C_BLUE}[INFO]${C_RESET}  $*"; log "[INFO] $*"; }
+ok()       { echo -e "${C_GREEN}[ OK ]${C_RESET}  $*"; log "[OK] $*"; }
+warn()     { echo -e "${C_YELLOW}[WARN]${C_RESET}  $*"; log "[WARN] $*"; }
+err()      { echo -e "${C_RED}[FAIL]${C_RESET}  $*"; log "[FAIL] $*"; }
+step()     { echo -e "\n${C_CYAN}${C_BOLD}==> $*${C_RESET}"; log "== $* =="; }
+die()      { err "$*"; exit 1; }
 
-# ---------- Step 1: Root check ----------
-info "Step 1/8 - Checking root privileges..."
-if [ "$EUID" -ne 0 ]; then
-  err "This script must be run as root. Try: sudo bash $0"
-fi
-log "Running as root. OK."
+confirm() {
+  local prompt="$1"
+  if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+  read -r -p "$prompt [y/N]: " reply
+  case "$reply" in
+    [yY][eE][sS]|[yY]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-# ---------- Step 2: OS check (must be Ubuntu 20.04 or 22.04) ----------
-info "Step 2/8 - Verifying operating system..."
-if [ ! -f /etc/os-release ]; then
-  err "Cannot detect OS. /etc/os-release not found."
-fi
+usage() {
+  sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
 
-. /etc/os-release
-if [ "$ID" != "ubuntu" ]; then
-  err "This script only supports Ubuntu. Detected: $ID"
-fi
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --hostname) HOSTNAME_ARG="$2"; shift 2 ;;
+    --skip-checks) SKIP_CHECKS=1; shift ;;
+    --no-firewall-disable) DISABLE_FIREWALL=0; shift ;;
+    --force) FORCE_INSTALL=1; shift ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --help|-h) usage ;;
+    *) die "Unknown option: $1 (use --help for usage)" ;;
+  esac
+done
 
-case "$VERSION_ID" in
-  20.04|22.04)
-    log "Detected Ubuntu $VERSION_ID ($VERSION_CODENAME). Supported."
-    ;;
-  *)
-    err "Unsupported Ubuntu version: $VERSION_ID. Requires 20.04 or 22.04."
-    ;;
-esac
-
-# ---------- Step 3: Architecture check ----------
-info "Step 3/8 - Checking system architecture..."
-ARCH=$(uname -m)
-if [ "$ARCH" != "x86_64" ]; then
-  err "cPanel requires x86_64 architecture. Found: $ARCH"
-fi
-log "Architecture: $ARCH. OK."
-
-# ---------- Step 4: RAM check ----------
-info "Step 4/8 - Checking RAM..."
-TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
-if [ "$TOTAL_RAM" -lt 1024 ]; then
-  err "Insufficient RAM: ${TOTAL_RAM}MB. cPanel requires at least 1024MB."
-elif [ "$TOTAL_RAM" -lt 2048 ]; then
-  warn "Only ${TOTAL_RAM}MB RAM detected. 2GB+ is recommended."
-else
-  log "RAM: ${TOTAL_RAM}MB. OK."
-fi
-
-# ---------- Step 5: Hostname (FQDN) ----------
-info "Step 5/8 - Verifying hostname (FQDN required)..."
-CURRENT_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
-
-if [[ ! "$CURRENT_HOSTNAME" =~ \..+\. ]] &&
-   [[ ! "$CURRENT_HOSTNAME" =~ ^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$ ]]; then
-  warn "Current hostname '$CURRENT_HOSTNAME' is not a valid FQDN."
-  read -p "Enter a fully-qualified hostname (e.g. server.example.com): " NEW_HOST
-  if [[ ! "$NEW_HOST" =~ ^[a-zA-Z0-9-]+\.[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$ ]]; then
-    err "Invalid FQDN. Must be like: server.example.com"
+# ---------------------------------------------------------------------------
+# Pre-flight: root check
+# ---------------------------------------------------------------------------
+require_root() {
+  step "Checking privileges"
+  if [ "$(id -u)" -ne 0 ]; then
+    die "This script must be run as root. Try: sudo bash $0"
   fi
-  hostnamectl set-hostname "$NEW_HOST"
-  echo "127.0.0.1 $NEW_HOST" >> /etc/hosts
-  log "Hostname set to: $NEW_HOST"
-else
-  log "Hostname: $CURRENT_HOSTNAME. OK."
-fi
+  ok "Running as root."
+}
 
-# ---------- Step 6: Update system & install prerequisites ----------
-info "Step 6/8 - Updating system and installing prerequisites..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y curl wget perl tar ca-certificates gnupg lsb-release
+# ---------------------------------------------------------------------------
+# OS detection & compatibility check
+# ---------------------------------------------------------------------------
+detect_os() {
+  step "Detecting operating system"
+  if [ ! -f /etc/os-release ]; then
+    die "Cannot detect OS: /etc/os-release not found."
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  OS_ID="${ID:-unknown}"
+  OS_VERSION="${VERSION_ID:-unknown}"
+  OS_MAJOR="${OS_VERSION%%.*}"
+  ARCH="$(uname -m)"
 
-# Disable AppArmor profiles that conflict with cPanel (optional but recommended)
-if systemctl is-active --quiet apparmor; then
-  warn "Disabling AppArmor (recommended for cPanel on Ubuntu)..."
-  systemctl stop apparmor
-  systemctl disable apparmor
-fi
+  info "Detected: ${PRETTY_NAME:-$OS_ID $OS_VERSION} (${ARCH})"
 
-# Disable UFW so cPanel can manage firewall rules (CSF is installed by default)
-if command -v ufw >/dev/null 2>&1; then
-  ufw disable || true
-fi
+  SUPPORTED=0
+  case "$OS_ID" in
+    almalinux|rocky|rhel|centos|cloudlinux)
+      if [ "$OS_MAJOR" -ge 8 ] 2>/dev/null; then
+        SUPPORTED=1
+      fi
+      ;;
+    *) SUPPORTED=0 ;;
+  esac
 
-log "System prepared."
+  if [ "$ARCH" != "x86_64" ]; then
+    warn "Architecture is '$ARCH'. cPanel requires 64-bit x86_64 hardware."
+    SUPPORTED=0
+  fi
 
-# ---------- Step 7: Download & run cPanel installer ----------
-info "Step 7/8 - Downloading and running cPanel installer..."
-warn "This step takes 30-60 minutes. DO NOT interrupt."
-warn "The installer will automatically request a 1 Monthly Cpanel license."
+  if [ "$SUPPORTED" -eq 1 ]; then
+    ok "This OS is officially supported by cPanel & WHM."
+  else
+    warn "This OS/version is NOT on cPanel's officially supported list."
+    warn "Supported: AlmaLinux/Rocky/CloudLinux/RHEL 8 or 9, 64-bit."
+    if [ "$FORCE_INSTALL" -eq 1 ]; then
+      warn "Continuing anyway because --force was specified. This will likely fail."
+    else
+      die "Aborting. Re-run with --force to attempt anyway (not recommended), or provision a supported OS image."
+    fi
+  fi
+}
 
-if [ -f /usr/local/cpanel/cpanel ]; then
-  log "cPanel already installed. Skipping installation, refreshing license only."
-else
-  cd /home
-  wget -N https://securedownloads.cpanel.net/latest || \
-      err "Failed to download cPanel installer."
-  # Run installer - it auto-detects Ubuntu and requests trial license
-  sh latest
-fi
+# ---------------------------------------------------------------------------
+# Hardware requirement checks
+# ---------------------------------------------------------------------------
+check_hardware() {
+  step "Checking hardware requirements"
+  if [ "$SKIP_CHECKS" -eq 1 ]; then
+    warn "Skipping hardware checks (--skip-checks given)."
+    return
+  fi
 
-# ---------- Step 8: Activate / verify the free trial license ----------
-info "Step 8/8 - Activating cPanel server license..."
-sleep 3
+  local mem_mb disk_gb cpu_mhz cpu_cores
+  mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+  disk_gb=$(df -BG --output=avail /home 2>/dev/null | tail -1 | tr -dc '0-9')
+  [ -z "$disk_gb" ] && disk_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+  cpu_cores=$(nproc)
+  cpu_mhz=$(lscpu 2>/dev/null | awk -F: '/CPU MHz/ {gsub(/ /,"",$2); printf "%d", $2}')
+  [ -z "$cpu_mhz" ] && cpu_mhz=$MIN_CPU_MHZ
 
-if [ -x /usr/local/cpanel/cpkeyclt ]; then
-  /usr/local/cpanel/cpkeyclt
-else
-  err "cpkeyclt not found. Installation may have failed."
-fi
+  info "RAM: ${mem_mb}MB | Free disk: ${disk_gb}GB | CPU cores: ${cpu_cores} | CPU speed: ${cpu_mhz}MHz"
 
-# Verify license status
-LICENSE_CHECK=$(/usr/local/cpanel/cpkeyclt 2>&1)
-if echo "$LICENSE_CHECK" | grep -qi "update succeeded\|success"; then
-  SERVER_IP=$(curl -s https://myip.cpanel.net || hostname -I | awk '{print $1}')
+  local fail=0
+  if [ "$mem_mb" -lt "$MIN_RAM_MB" ]; then
+    warn "RAM (${mem_mb}MB) is below the recommended minimum (${MIN_RAM_MB}MB)."
+    fail=1
+  fi
+  if [ -n "$disk_gb" ] && [ "$disk_gb" -lt "$MIN_DISK_GB" ]; then
+    warn "Free disk space (${disk_gb}GB) is below the recommended minimum (${MIN_DISK_GB}GB)."
+    fail=1
+  fi
+
+  if [ "$fail" -eq 1 ]; then
+    if ! confirm "Hardware is below recommended specs. Continue anyway?"; then
+      die "Aborted due to insufficient hardware resources."
+    fi
+  else
+    ok "Hardware meets recommended requirements."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Hostname configuration
+# ---------------------------------------------------------------------------
+configure_hostname() {
+  step "Configuring hostname"
+  local current_hostname
+  current_hostname=$(hostname -f 2>/dev/null || hostname)
+
+  if [ -n "$HOSTNAME_ARG" ]; then
+    hostnamectl set-hostname "$HOSTNAME_ARG"
+    ok "Hostname set to $HOSTNAME_ARG"
+    return
+  fi
+
+  if [[ "$current_hostname" != *.*.* ]] && [[ "$current_hostname" != *"."*"."* ]]; then
+    warn "Current hostname '$current_hostname' does not look like a fully-qualified domain name (e.g. server.example.com)."
+    if [ "$ASSUME_YES" -eq 0 ]; then
+      read -r -p "Enter an FQDN hostname to use (leave blank to keep current): " new_host
+      if [ -n "$new_host" ]; then
+        hostnamectl set-hostname "$new_host"
+        ok "Hostname set to $new_host"
+      else
+        warn "Keeping existing hostname. cPanel may prompt you again during setup."
+      fi
+    fi
+  else
+    ok "Current hostname '$current_hostname' looks like a valid FQDN."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Disable conflicting services
+# ---------------------------------------------------------------------------
+disable_conflicts() {
+  step "Disabling services that commonly conflict with cPanel"
+  if [ "$DISABLE_FIREWALL" -eq 0 ]; then
+    warn "Skipping service disable step (--no-firewall-disable given)."
+    return
+  fi
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^NetworkManager'; then
+    systemctl disable --now NetworkManager >/dev/null 2>&1 && ok "NetworkManager disabled." || warn "Could not disable NetworkManager."
+  fi
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^firewalld'; then
+    systemctl disable --now firewalld >/dev/null 2>&1 && ok "firewalld disabled (WHM ships its own firewall/CSF options)." || warn "Could not disable firewalld."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Install prerequisites
+# ---------------------------------------------------------------------------
+install_prereqs() {
+  step "Installing prerequisites (perl, curl, tar, cronie)"
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y perl curl tar cronie >>"$LOG_FILE" 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y perl curl tar cronie >>"$LOG_FILE" 2>&1
+  else
+    die "No supported package manager (dnf/yum) found."
+  fi
+  systemctl enable --now crond >/dev/null 2>&1
+  ok "Prerequisites installed."
+}
+
+# ---------------------------------------------------------------------------
+# Run the official cPanel installer
+# ---------------------------------------------------------------------------
+run_cpanel_installer() {
+  step "Downloading and running the official cPanel & WHM installer"
+  info "Source: $CPANEL_INSTALLER_URL"
+  info "This step can take 30-90+ minutes depending on your server and network speed."
+  info "Progress output is also being logged to $LOG_FILE"
+
+  mkdir -p /home
+  cd /home || die "Could not cd into /home"
+
+  if ! curl -sS -o latest -L "$CPANEL_INSTALLER_URL"; then
+    die "Failed to download the cPanel installer. Check your internet connectivity/DNS."
+  fi
+
+  ok "Installer downloaded. Launching installation (this will take a while)..."
+  # Run inside a screen session if available so it survives disconnects
+  if command -v screen >/dev/null 2>&1; then
+    info "Running installer inside a 'screen' session named cpanel_install."
+    screen -dmS cpanel_install bash -c "sh /home/latest 2>&1 | tee -a $LOG_FILE"
+    info "Installer launched in background screen session."
+    info "Attach anytime with: screen -r cpanel_install"
+    info "Waiting for installation to complete..."
+    while screen -list 2>/dev/null | grep -q "cpanel_install"; do
+      sleep 30
+      echo -n "."
+    done
+    echo ""
+  else
+    sh /home/latest 2>&1 | tee -a "$LOG_FILE"
+  fi
+
+  if [ ! -x /usr/local/cpanel/cpkeyclt ]; then
+    die "cPanel installation does not appear to have completed successfully (cpkeyclt not found). Check $LOG_FILE."
+  fi
+  ok "cPanel & WHM installation finished."
+}
+
+# ---------------------------------------------------------------------------
+# Request / activate the free trial license
+# ---------------------------------------------------------------------------
+activate_trial_license() {
+  step "Requesting / activating the cPanel free trial license"
+  info "New installations are automatically eligible for a free evaluation license."
+  info "Contacting cPanel license servers via /usr/local/cpanel/cpkeyclt ..."
+
+  if /usr/local/cpanel/cpkeyclt >>"$LOG_FILE" 2>&1; then
+    ok "License client executed successfully."
+  else
+    warn "cpkeyclt returned a non-zero exit code. Check $LOG_FILE for details."
+  fi
+
+  sleep 5
+
+  local pub_ip
+  pub_ip=$(curl -sS -4 https://ifconfig.co 2>/dev/null || curl -sS -4 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+  info "Server public IP detected as: ${pub_ip:-unknown}"
+  info "You can verify license status any time at: http://verify.cpanel.net/?ip=${pub_ip:-}"
+
+  if [ -f /usr/local/cpanel/cpanel.lisc ] || [ -f /usr/local/cpanel/license.dat ]; then
+    ok "A license file was found on disk. Trial license appears to be installed."
+  else
+    warn "No license file detected yet. It may take a few minutes to propagate."
+    warn "You can manually re-run: /usr/local/cpanel/cpkeyclt"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Final summary
+# ---------------------------------------------------------------------------
+print_summary() {
+  local ip host
+  ip=$(hostname -I | awk '{print $1}')
+  host=$(hostname -f 2>/dev/null || hostname)
+
+  step "Installation Summary"
+  echo -e "${C_GREEN}cPanel & WHM installation process is complete!${C_RESET}"
   echo ""
-  echo -e "${GREEN}=====================================================${NC}"
-  echo -e "${GREEN}   ✅ cPanel License activated successfully!      ${NC}"
-  echo -e "${GREEN}=====================================================${NC}"
-  echo -e "  🌐 WHM URL     : ${YELLOW}https://${SERVER_IP}:2087${NC}"
-  echo -e "  👤 Username    : ${YELLOW}root${NC}"
-  echo -e "  🔑 Password    : ${YELLOW}${NC}"
-  echo -e "  📅 Trial length: ${YELLOW}15 days${NC}"
-  echo -e "  💡 Convert to paid: ${YELLOW}https://sys.llc${NC}"
-  echo -e "${GREEN}=====================================================${NC}"
-else
-  warn "License activation may have failed. Output:"
-  echo "$LICENSE_CHECK"
+  echo -e "  ${C_BOLD}WHM (admin) login:${C_RESET}   https://${host}:2087   (or https://${ip}:2087)"
+  echo -e "  ${C_BOLD}cPanel (user) login:${C_RESET} https://${host}:2083"
+  echo -e "  ${C_BOLD}Username:${C_RESET}            root"
+  echo -e "  ${C_BOLD}License check:${C_RESET}       http://verify.cpanel.net/?ip=${ip}"
+  echo -e "  ${C_BOLD}Full log file:${C_RESET}       ${LOG_FILE}"
   echo ""
-  echo "Manual troubleshooting:"
-  echo "  1. Email Support securenotic@gmail.com"
-  echo "  2. Website Discus   https://sys.llc"
-  echo "  3. Re-run Problem:              /usr/local/cpanel/cpkeyclt"
-fi
+  echo -e "${C_YELLOW}Reminder:${C_RESET} the free trial license is time-limited (historically up to"
+  echo -e "15 days). Purchase a license from https://store.cpanel.net before it expires"
+  echo -e "to avoid service interruption."
+  echo ""
+}
 
-exit 0
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  touch "$LOG_FILE" 2>/dev/null || LOG_FILE="./cpanel-trial-install.log"
+  echo -e "${C_BOLD}cPanel & WHM Free Trial Installer v${SCRIPT_VERSION}${C_RESET}"
+  echo "Log: $LOG_FILE"
+
+  require_root
+  detect_os
+  check_hardware
+  configure_hostname
+  disable_conflicts
+  install_prereqs
+  run_cpanel_installer
+  activate_trial_license
+  print_summary
+}
+
+main "$@"
